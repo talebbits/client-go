@@ -1,6 +1,7 @@
 package sanity
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -170,6 +171,47 @@ func (c *Client) performGET(
 	}
 }
 
+func (c *Client) performPOST(
+	ctx context.Context,
+	path string,
+	payload []byte,
+	output interface{},
+) (*http.Response, error) {
+	req, err := c.buildPOSTRequest(http.MethodPost, path, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	req = req.WithContext(ctx)
+
+	bckoff := c.backoff
+	for {
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("[GET %s] failed: %w", req.URL.String(), err)
+		}
+
+		defer func() {
+			_ = resp.Body.Close()
+		}()
+
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			return resp, json.NewDecoder(resp.Body).Decode(output)
+		}
+
+		if !isStatusCodeRetriable(resp.StatusCode) {
+			return nil, c.handleErrorResponse(req, resp)
+		}
+
+		_ = resp.Body.Close()
+
+		if c.callbacks.OnErrorWillRetry != nil {
+			c.callbacks.OnErrorWillRetry(err)
+		}
+		time.Sleep(bckoff.Duration())
+	}
+}
+
 func (c *Client) handleErrorResponse(req *http.Request, resp *http.Response) error {
 	responseBody := []byte("<no response body>")
 
@@ -185,6 +227,21 @@ func (c *Client) handleErrorResponse(req *http.Request, resp *http.Response) err
 		Response: resp,
 		Body:     responseBody,
 	}
+}
+
+func (c *Client) buildPOSTRequest(method string, path string, payload []byte) (*http.Request, error) {
+	url := c.buildURL(path, nil)
+
+	req, err := http.NewRequest(method, url.String(), bytes.NewBuffer(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return req, nil
 }
 
 func (c *Client) buildRequest(method string, path string, params url.Values) (*http.Request, error) {
